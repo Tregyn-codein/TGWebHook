@@ -1,51 +1,58 @@
 # app.py
-from quart import Quart, request, jsonify
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Query, HTTPException, status
+from fastapi.responses import JSONResponse
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 import os
 
-app = Quart(__name__)
-
-# Конфигурация из переменных окружения
-API_ID = os.environ.get('API_ID')
-API_HASH = os.environ.get('API_HASH')
-SESSION_STRING = os.environ.get('SESSION_STRING')
-SECRET_KEY = os.environ.get('SECRET_KEY', 'default_secret')
-
 # Инициализация клиента Telegram
-client = TelegramClient(
-    StringSession(SESSION_STRING),
-    API_ID,
-    API_HASH
-)
+async def create_telegram_client():
+    client = TelegramClient(
+        StringSession(os.getenv('SESSION_STRING')),
+        int(os.getenv('API_ID')),
+        os.getenv('API_HASH')
+    )
+    await client.start()
+    return client
 
-@app.route('/api/message', methods=['GET'])
-async def send_message():
+# Lifespan handler
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Старт приложения
+    app.state.telegram_client = await create_telegram_client()
+    yield
+    # Завершение работы приложения
+    await app.state.telegram_client.disconnect()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/api/message")
+async def send_message(
+    key: str = Query(..., description="Секретный ключ для доступа"),
+    user: str = Query(..., description="Имя пользователя или chat_id получателя"),
+    message: str = Query(..., description="Текст сообщения для отправки")
+):
     # Проверка секретного ключа
-    if request.args.get('key') != SECRET_KEY:
-        return jsonify({"status": "error", "message": "Invalid key"}), 403
-    
-    # Получение параметров
-    user = request.args.get('user')
-    message = request.args.get('message')
-    
-    if not user or not message:
-        return jsonify({"status": "error", "message": "Missing parameters"}), 400
-    
+    if key != os.getenv('SECRET_KEY'):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid security key"
+        )
+
     try:
         # Отправка сообщения
-        await client.send_message(user, message)
-        return jsonify({"status": "success"}), 200
+        await app.state.telegram_client.send_message(user, message)
+        return JSONResponse(
+            content={"status": "success"},
+            status_code=status.HTTP_200_OK
+        )
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
-@app.before_serving
-async def startup():
-    await client.start()
-
-@app.after_serving
-async def shutdown():
-    await client.disconnect()
-
-if __name__ == '__main__':
-    app.run()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
